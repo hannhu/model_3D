@@ -1,104 +1,37 @@
 """
 Fusion 360 脚本: 六边形镂空 (Honeycomb Hollow)
 手动选择要镂空的面，自动生成六边形图案并切除。
+
+实际打孔逻辑委托给 hollow_lib.punch_hex_grid，享受批量优化：
+- sketch.isComputeDeferred = True (避免 O(N²) 重算)
+- 共享 SketchPoint (确保 100+ 孔时 profile 闭环)
+- 缓存 cos/sin 表
+- 显式 participantBodies
+- profile 面积上限过滤 (避免整面被误切)
 """
 
-import traceback
+import os
+import sys
 import math
+import traceback
+
 import adsk.core
 import adsk.fusion
+
+# 让脚本能 import 同目录下的 hollow_lib
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+import hollow_lib  # noqa: E402
 
 app = adsk.core.Application.get()
 ui = app.userInterface
 
 # ===== 可调参数 (单位: cm, Fusion 内部单位, 1cm = 10mm) =====
-HEX_RADIUS = 0.5         # 六边形外接圆半径 (5mm)
+HEX_RADIUS = 0.5          # 六边形外接圆半径 (5mm)
 WALL_THICK = 0.2          # 六边形之间最小壁厚 (2mm)
 MARGIN = 0.2              # 图案距面边缘留距 (2mm)
-CUT_DEPTH = 0.5           # 切割深度 (5mm)，设为墙壁厚度即可穿透且不伤背后结构
-
-
-def draw_hex(lines, cx, cy, r):
-    """绘制一个 pointy-top 正六边形"""
-    pts = []
-    for i in range(6):
-        a = math.radians(60 * i + 90)
-        pts.append(adsk.core.Point3D.create(
-            cx + r * math.cos(a),
-            cy + r * math.sin(a), 0))
-    for i in range(6):
-        lines.addByTwoPoints(pts[i], pts[(i + 1) % 6])
-
-
-def process_face(root, face, dx, dy, r):
-    """在一个面上生成六边形网格并切除，返回切除的六边形数量"""
-    sketch = root.sketches.add(face)
-
-    p1 = sketch.modelToSketchSpace(face.boundingBox.minPoint)
-    p2 = sketch.modelToSketchSpace(face.boundingBox.maxPoint)
-
-    x0 = min(p1.x, p2.x) + MARGIN
-    x1 = max(p1.x, p2.x) - MARGIN
-    y0 = min(p1.y, p2.y) + MARGIN
-    y1 = max(p1.y, p2.y) - MARGIN
-
-    if x1 - x0 < 2 * r or y1 - y0 < 2 * r:
-        return 0
-
-    lines = sketch.sketchCurves.sketchLines
-    row = 0
-    drawn = 0
-    y = y0 + r
-
-    while y + r <= y1:
-        offset = dx / 2 if row % 2 else 0
-        x = x0 + r + offset
-        while x + r <= x1:
-            inside = True
-            for i in range(6):
-                a = math.radians(60 * i + 90)
-                px = x + r * math.cos(a)
-                py = y + r * math.sin(a)
-                if px < x0 or px > x1 or py < y0 or py > y1:
-                    inside = False
-                    break
-            if inside:
-                draw_hex(lines, x, y, r)
-                drawn += 1
-            x += dx
-        y += dy
-        row += 1
-
-    if drawn == 0:
-        return 0
-
-    profs = adsk.core.ObjectCollection.create()
-    for pi in range(sketch.profiles.count):
-        prof = sketch.profiles.item(pi)
-        if prof.profileLoops.count == 1:
-            loop = prof.profileLoops.item(0)
-            if loop.profileCurves.count == 6:
-                profs.add(prof)
-
-    if profs.count == 0:
-        return 0
-
-    ext = root.features.extrudeFeatures
-    dist = adsk.fusion.DistanceExtentDefinition.create(
-        adsk.core.ValueInput.createByReal(CUT_DEPTH))
-
-    for direction in (adsk.fusion.ExtentDirections.PositiveExtentDirection,
-                      adsk.fusion.ExtentDirections.NegativeExtentDirection):
-        try:
-            inp = ext.createInput(profs, adsk.fusion.FeatureOperations.CutFeatureOperation)
-            inp.setOneSideExtent(dist, direction)
-            ext.add(inp)
-            return profs.count
-        except Exception:
-            continue
-
-    app.log(f'警告: 面 (area={face.area:.2f}) 切除失败，已跳过')
-    return 0
+CUT_DEPTH_EXPR = '5 mm'   # 切割深度表达式（穿透薄壁即可）
 
 
 def run(_context: str):
@@ -108,9 +41,6 @@ def run(_context: str):
             ui.messageBox('请先打开设计文件')
             return
 
-        root = design.rootComponent
-
-        # 手动选面
         faces = []
         while True:
             try:
@@ -133,12 +63,9 @@ def run(_context: str):
             ui.messageBox('未选择任何面，已退出。')
             return
 
-        grid_r = HEX_RADIUS + WALL_THICK / math.sqrt(3)
-        dx = math.sqrt(3) * grid_r
-        dy = 1.5 * grid_r
-
         face_done = 0
         hex_total = 0
+        timings_summary = []
 
         timeline = design.timeline
         start_index = timeline.count
@@ -154,16 +81,36 @@ def run(_context: str):
                 break
 
             progress.progressValue = fi
-            progress.message = f'处理面 {fi + 1}/{len(faces)}（已完成 {face_done} 面, {hex_total} 孔）'
+            progress.message = (
+                f'处理面 {fi + 1}/{len(faces)}'
+                f'（已完成 {face_done} 面, {hex_total} 孔）'
+            )
             adsk.doEvents()
 
             try:
-                n = process_face(root, face, dx, dy, HEX_RADIUS)
-                if n > 0:
+                body = face.body
+                result = hollow_lib.punch_hex_grid(
+                    body=body,
+                    face=face,
+                    hex_radius_cm=HEX_RADIUS,
+                    hex_wall_cm=WALL_THICK,
+                    margin_cm=MARGIN,
+                    cut_depth_expr=CUT_DEPTH_EXPR,
+                    sketch_name=f'sk_hex_{fi}',
+                )
+                if result.get('ok'):
                     face_done += 1
-                    hex_total += n
+                    hex_total += result.get('hex_count', 0)
+                    timings_summary.append(
+                        f"  面{fi+1}: {result.get('hex_count')}孔 "
+                        f"draw={result.get('draw_ms')}ms "
+                        f"recompute={result.get('recompute_ms')}ms "
+                        f"cut={result.get('cut_ms')}ms"
+                    )
+                else:
+                    app.log(f"面{fi+1} 跳过: {result.get('err', 'unknown')}")
             except Exception as e:
-                app.log(f'处理面时出错: {e}')
+                app.log(f'处理面时出错: {e}\n{traceback.format_exc()}')
                 continue
 
         progress.hide()
@@ -173,9 +120,13 @@ def run(_context: str):
             group = timeline.timelineGroups.add(start_index, end_index)
             group.name = '六边形镂空'
 
-        msg = f'完成！处理了 {face_done} 个面，共 {hex_total} 个六边形。'
+        msg_lines = [f'完成！处理了 {face_done} 个面，共 {hex_total} 个六边形。']
+        if timings_summary:
+            msg_lines.append('')
+            msg_lines.extend(timings_summary)
+        msg = '\n'.join(msg_lines)
         if progress.wasCancelled:
-            msg = '已取消。' + msg
+            msg = '已取消。\n' + msg
         ui.messageBox(msg)
 
     except Exception:

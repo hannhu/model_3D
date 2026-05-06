@@ -1,0 +1,11 @@
+{
+	"autodeskProduct":	"Fusion",
+	"type":	"script",
+	"author":	"huhan",
+	"description":	{
+		"":	"备份当前 Fusion 项目所有 F3D 文件到本地目录（同名覆盖）"
+	},
+	"version":	"1.0.0",
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true
+}

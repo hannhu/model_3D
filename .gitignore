@@ -1,0 +1,16 @@
+# Preview screenshots / images
+*.png
+
+# Mesh exports (kept locally only)
+*.stl
+*.3mf
+
+# Cloned third-party repos (managed separately)
+fusion360-mcp-server/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+__pycache__/
+*.pyc
